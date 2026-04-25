@@ -13,7 +13,27 @@ from pathlib import Path
 
 # ─── Config paths ────────────────────────────────────────────────────────────
 OPENCODE_JSON = Path.home() / ".config/opencode/opencode.json"
-OMO_JSONC     = Path.home() / ".config/opencode/oh-my-openagent.jsonc"
+_CFG_DIR      = Path.home() / ".config/opencode"
+
+# Plugin config file resolution priority (matches oh-my-openagent's own logic):
+#   1. oh-my-openagent.json   (canonical)
+#   2. oh-my-openagent.jsonc  (canonical, jsonc)
+#   3. oh-my-opencode.json    (legacy)
+#   4. oh-my-opencode.jsonc   (legacy, jsonc)
+_OMO_CANDIDATES = [
+    _CFG_DIR / "oh-my-openagent.json",
+    _CFG_DIR / "oh-my-openagent.jsonc",
+    _CFG_DIR / "oh-my-opencode.json",
+    _CFG_DIR / "oh-my-opencode.jsonc",
+]
+
+
+def resolve_omo_path() -> Path:
+    """Return the first existing config file, or the canonical default for creation."""
+    for p in _OMO_CANDIDATES:
+        if p.exists():
+            return p
+    return _OMO_CANDIDATES[0]          # oh-my-openagent.json
 
 # ─── Agent / Category metadata ───────────────────────────────────────────────
 # desc:        简短角色说明
@@ -308,15 +328,17 @@ def strip_jsonc(text: str) -> str:
 
 
 def load_omo() -> dict:
-    if not OMO_JSONC.exists():
+    omo_path = resolve_omo_path()
+    if not omo_path.exists():
         return {"agents": {}, "categories": {}}
     try:
-        return json.loads(strip_jsonc(OMO_JSONC.read_text()))
+        return json.loads(strip_jsonc(omo_path.read_text()))
     except json.JSONDecodeError as e:
-        sys.exit(f"Error parsing {OMO_JSONC}: {e}")
+        sys.exit(f"Error parsing {omo_path}: {e}")
 
 
 def save_omo(data: dict) -> None:
+    omo_path = resolve_omo_path()
     out: dict = {}
     if "$schema" in data:
         out["$schema"] = data["$schema"]
@@ -324,7 +346,7 @@ def save_omo(data: dict) -> None:
     out["categories"] = {k: v for k, v in data.get("categories", {}).items() if v}
     if "_migrations" in data:
         out["_migrations"] = data["_migrations"]
-    OMO_JSONC.write_text(json.dumps(out, indent=2, ensure_ascii=False) + "\n")
+    omo_path.write_text(json.dumps(out, indent=2, ensure_ascii=False) + "\n")
 
 
 def load_models() -> list:
@@ -1214,7 +1236,7 @@ def main(stdscr):
             save_omo(config)
             original = deepcopy(config)
             modified = False
-            flash(stdscr, f"已保存 → {OMO_JSONC}", C_CHANGED)
+            flash(stdscr, f"已保存 → {resolve_omo_path()}", C_CHANGED)
 
         elif key == ord('r'):
             config   = deepcopy(original)
@@ -1225,7 +1247,7 @@ def main(stdscr):
             if modified:
                 if confirm(stdscr, "有未保存修改，保存后退出？"):
                     save_omo(config)
-                    flash(stdscr, f"已保存 → {OMO_JSONC}", C_CHANGED)
+                    flash(stdscr, f"已保存 → {resolve_omo_path()}", C_CHANGED)
             break
 
 
@@ -1240,6 +1262,7 @@ if __name__ == "__main__":
 
     if not has_opencode and not OPENCODE_JSON.exists():
         sys.exit("错误: opencode 命令不可用且 opencode.json 不存在。")
-    if not OMO_JSONC.exists():
-        print(f"提示: {OMO_JSONC} 不存在，保存时将自动创建。")
+    omo_path = resolve_omo_path()
+    if not omo_path.exists():
+        print(f"提示: {omo_path} 不存在，保存时将自动创建。")
     curses.wrapper(main)
