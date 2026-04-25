@@ -144,6 +144,28 @@ INFO = {
             ],
             "variant_rec": "medium",
         },
+        "review-gpt": {
+            "desc": "GPT 代码审查员：只读 review，专注 bug、回归风险、边界条件与可维护性",
+            "traits": ["代码审查", "只读分析", "回归识别", "风险提示"],
+            "recommended": [
+                "openai/gpt-5.4",
+                "msicu-codex/gpt-5.4",
+                "kiro/claude-sonnet-4-6",
+                "volcengine/ark-code-latest",
+            ],
+            "variant_rec": "high",
+        },
+        "review-opus": {
+            "desc": "Opus 代码审查员：只读 review，强调正确性、架构问题与长期维护风险",
+            "traits": ["代码审查", "深度推理", "架构洞察", "长期维护"],
+            "recommended": [
+                "bytecat-claude-real/claude-opus-4-6",
+                "kiro/claude-opus-4-6",
+                "kiro/claude-opus-4-6-thinking",
+                "openai/gpt-5.4",
+            ],
+            "variant_rec": "xhigh",
+        },
     },
     "categories": {
         "quick": {
@@ -338,6 +360,22 @@ def load_models() -> list:
         for mname in pdata.get("models", {}).keys():
             result.append(f"{pname}/{mname}")
     return sorted(result)
+
+
+def split_model_ref(model: str) -> tuple[str, str]:
+    if not model or "/" not in model:
+        return "", ""
+    provider, model_name = model.split("/", 1)
+    return provider.strip(), model_name.strip()
+
+
+def build_provider_models(all_models: list) -> dict[str, set[str]]:
+    provider_models: dict[str, set[str]] = {}
+    for model in all_models:
+        provider, model_name = split_model_ref(model)
+        if provider and model_name:
+            provider_models.setdefault(provider, set()).add(model_name)
+    return provider_models
 
 
 def get_info(section: str, name: str) -> dict:
@@ -751,6 +789,206 @@ def del_cfg_key(config: dict, section: str, name: str, key: str):
         config.get(section, {}).pop(name, None)
 
 
+def iter_config_models(config: dict):
+    for section in ("agents", "categories"):
+        for name, cfg in config.get(section, {}).items():
+            model = cfg.get("model", "")
+            provider, model_name = split_model_ref(model)
+            if provider and model_name:
+                yield section, name, provider, model_name
+
+
+def get_source_provider_choices(config: dict, provider_models: dict[str, set[str]]) -> list[dict]:
+    used: dict[str, list[str]] = {}
+    for _, _, provider, model_name in iter_config_models(config):
+        used.setdefault(provider, []).append(model_name)
+
+    choices = []
+    for provider, names in sorted(used.items()):
+        targets = 0
+        max_replaceable = 0
+        unique_names = set(names)
+        for other, other_models in provider_models.items():
+            if other == provider:
+                continue
+            replaceable = sum(1 for model_name in names if model_name in other_models)
+            if replaceable:
+                targets += 1
+                max_replaceable = max(max_replaceable, replaceable)
+        if targets:
+            choices.append({
+                "value": provider,
+                "label": (
+                    f"{provider}  [{len(names)} 项配置, {len(unique_names)} 个模型名, "
+                    f"可切到 {targets} 个 provider]"
+                ),
+                "detail": f"最多可一次替换 {max_replaceable} 项配置",
+            })
+    return choices
+
+
+def get_target_provider_choices(
+    config: dict,
+    source_provider: str,
+    provider_models: dict[str, set[str]],
+) -> list[dict]:
+    source_entries = [
+        model_name
+        for _, _, provider, model_name in iter_config_models(config)
+        if provider == source_provider
+    ]
+    if not source_entries:
+        return []
+
+    choices = []
+    source_total = len(source_entries)
+    unique_source = sorted(set(source_entries))
+    for provider, models in sorted(provider_models.items()):
+        if provider == source_provider:
+            continue
+        matched_entries = [model_name for model_name in source_entries if model_name in models]
+        if not matched_entries:
+            continue
+        matched_unique = sorted(set(matched_entries))
+        missing_unique = [model_name for model_name in unique_source if model_name not in models]
+        sample = ", ".join(matched_unique[:3])
+        if len(matched_unique) > 3:
+            sample += ", ..."
+        detail = f"将替换 {len(matched_entries)}/{source_total} 项"
+        if sample:
+            detail += f"；匹配: {sample}"
+        if missing_unique:
+            detail += f"；缺少 {len(missing_unique)} 个同名模型"
+        choices.append({
+            "value": provider,
+            "label": (
+                f"{provider}  [可替换 {len(matched_entries)}/{source_total} 项, "
+                f"{len(matched_unique)} 个同名模型]"
+            ),
+            "detail": detail,
+            "replaceable": len(matched_entries),
+        })
+
+    choices.sort(key=lambda item: (-item["replaceable"], item["value"]))
+    return choices
+
+
+def batch_replace_provider(
+    config: dict,
+    source_provider: str,
+    target_provider: str,
+    provider_models: dict[str, set[str]],
+) -> int:
+    target_models = provider_models.get(target_provider, set())
+    replaced = 0
+    for section in ("agents", "categories"):
+        for cfg in config.get(section, {}).values():
+            provider, model_name = split_model_ref(cfg.get("model", ""))
+            if provider == source_provider and model_name in target_models:
+                cfg["model"] = f"{target_provider}/{model_name}"
+                replaced += 1
+    return replaced
+
+
+def pick_menu(stdscr, title: str, subtitle: str, options: list[dict], footer: str) -> "str | None":
+    if not options:
+        return None
+
+    selected = 0
+    scroll = 0
+
+    while True:
+        stdscr.erase()
+        h, w = stdscr.getmaxyx()
+        vis = max(1, h - 7)
+
+        safe_addstr(stdscr, 0, max(0, (w - len(title)) // 2), title[:w],
+                    curses.A_BOLD | curses.A_REVERSE)
+        if subtitle:
+            safe_addstr(stdscr, 1, 0, f" {subtitle}"[:w], curses.color_pair(C_DIM))
+        safe_hline(stdscr, 2, 0, curses.ACS_HLINE, w)
+
+        if selected < scroll:
+            scroll = selected
+        elif selected >= scroll + vis:
+            scroll = selected - vis + 1
+
+        for i, option in enumerate(options[scroll:scroll + vis]):
+            idx = scroll + i
+            y = i + 3
+            prefix = "▶ " if idx == selected else "  "
+            attr = curses.A_REVERSE | curses.A_BOLD if idx == selected else curses.A_NORMAL
+            safe_addstr(stdscr, y, 0, f"{prefix}{option['label']}".ljust(w)[:w], attr)
+
+        detail = options[selected].get("detail", "")
+        safe_hline(stdscr, h - 3, 0, curses.ACS_HLINE, w)
+        if detail:
+            safe_addstr(stdscr, h - 2, 0, f" {detail}"[:w - 1], curses.color_pair(C_MODEL))
+        safe_addstr(stdscr, h - 1, 0, footer[:w - 1], curses.color_pair(C_DIM))
+        stdscr.refresh()
+
+        key = stdscr.getch()
+        if key in (curses.KEY_UP, ord('k')) and selected > 0:
+            selected -= 1
+        elif key in (curses.KEY_DOWN, ord('j')) and selected < len(options) - 1:
+            selected += 1
+        elif key == curses.KEY_PPAGE:
+            selected = max(0, selected - vis)
+        elif key == curses.KEY_NPAGE:
+            selected = min(len(options) - 1, selected + vis)
+        elif key in (curses.KEY_ENTER, ord('\n'), ord('\r')):
+            return options[selected]["value"]
+        elif key in (ord('q'), 27):
+            return None
+
+
+def run_batch_provider_replace(stdscr, config: dict, all_models: list) -> int:
+    provider_models = build_provider_models(all_models)
+    source_choices = get_source_provider_choices(config, provider_models)
+    if not source_choices:
+        flash(stdscr, "当前没有可批量切换 provider 的模型配置", C_DIM, ms=1200)
+        return 0
+
+    source_provider = pick_menu(
+        stdscr,
+        " Select source provider ",
+        "选择当前正在使用、准备被统一替换的 provider",
+        source_choices,
+        " ↑↓/jk:移动  Enter:选择  ESC/q:取消 ",
+    )
+    if not source_provider:
+        return 0
+
+    target_choices = get_target_provider_choices(config, source_provider, provider_models)
+    if not target_choices:
+        flash(stdscr, "目标 provider 中没有找到可替换的同名模型", C_DANGER, ms=1200)
+        return 0
+
+    target_provider = pick_menu(
+        stdscr,
+        " Select target provider ",
+        f"将 {source_provider} 的同名模型批量切到哪个 provider",
+        target_choices,
+        " ↑↓/jk:移动  Enter:选择  ESC/q:取消 ",
+    )
+    if not target_provider:
+        return 0
+
+    replaceable = next(
+        item["replaceable"] for item in target_choices if item["value"] == target_provider
+    )
+    if not confirm(
+        stdscr,
+        f"把 {replaceable} 项 {source_provider} 模型批量替换为 {target_provider}？",
+    ):
+        return 0
+
+    replaced = batch_replace_provider(config, source_provider, target_provider, provider_models)
+    if replaced:
+        flash(stdscr, f"已批量替换 {replaced} 项模型 provider", C_CHANGED, ms=1200)
+    return replaced
+
+
 # ─── Main TUI ────────────────────────────────────────────────────────────────
 def build_items():
     items = [("header", "── Agents ──", None)]
@@ -775,8 +1013,6 @@ def main(stdscr):
     curses.curs_set(0)
 
     all_models = load_models()
-    rec_all    = set(m for sec in INFO.values() for item in sec.values()
-                     for m in item.get("recommended", []))
 
     config   = load_omo()
     original = deepcopy(config)
@@ -918,7 +1154,10 @@ def main(stdscr):
 
         # ── Footer ───────────────────────────────────────────────────────────
         mod_tag     = "  [已修改 — s保存]" if modified else ""
-        footer      = f" ↑↓/jk:移动  m:改模型  v:改variant  ?:详情  s:保存  r:重置  q:退出{mod_tag} "
+        footer      = (
+            f" ↑↓/jk:移动  m:改模型  v:改variant  b:批量换provider  ?:详情"
+            f"  s:保存  r:重置  q:退出{mod_tag} "
+        )
         footer_attr = (curses.color_pair(C_CHANGED) | curses.A_BOLD) if modified \
                       else curses.color_pair(C_DIM)
         safe_addstr(stdscr, h - 1, 0, footer[:w - 1], footer_attr)
@@ -961,6 +1200,11 @@ def main(stdscr):
                     del_cfg_key(config, cur_section, cur_name, "variant")
                 else:
                     set_cfg(config, cur_section, cur_name, "variant", result)
+                modified = config != original
+
+        elif key == ord('b'):
+            replaced = run_batch_provider_replace(stdscr, config, all_models)
+            if replaced:
                 modified = config != original
 
         elif key == ord('?'):
